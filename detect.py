@@ -76,6 +76,7 @@ def run(
     iou_thres=0.45,  # NMS IOU threshold
     max_det=1000,  # maximum detections per image
     device="",  # cuda device, i.e. 0 or 0,1,2,3 or cpu
+    save_ball=False,
     view_img=False,  # show results
     save_txt=False,  # save results to *.txt
     save_csv=False,  # save results in CSV format
@@ -108,8 +109,11 @@ def run(
 
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
-    (save_dir / "labels" if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
-
+    save_dir_images = save_dir / "images"
+    save_dir_labels = save_dir / "labels"
+    save_dir_images.mkdir(parents=True, exist_ok=True)
+    save_dir_labels.mkdir(parents=True, exist_ok=True)
+    
     # Load model
     device = select_device(device)
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
@@ -158,22 +162,6 @@ def run(
         with dt[2]:
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
-        # Second-stage classifier (optional)
-        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
-
-        # Define the path for the CSV file
-        csv_path = save_dir / "predictions.csv"
-
-        # Create or append to the CSV file
-        def write_to_csv(image_name, prediction, confidence):
-            """Writes prediction data for an image to a CSV file, appending if the file exists."""
-            data = {"Image Name": image_name, "Prediction": prediction, "Confidence": confidence}
-            with open(csv_path, mode="a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=data.keys())
-                if not csv_path.is_file():
-                    writer.writeheader()
-                writer.writerow(data)
-
         # Process predictions
         for i, det in enumerate(pred):  # per image
             seen += 1
@@ -190,17 +178,35 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
 
+                # Sort detections by class (assuming classes are indexed as 0: red, 1: yellow, 2: blue)
+                sorted_det = sorted(det, key=lambda x: int(x[5]))
+
+                # Ensure at least one detection per class
+                class_counts = {0: [], 1: [], 2: []}  # dictionary to store detections by class
+                for d in sorted_det:
+                    class_counts[int(d[5])].append(d)
+
+                # Add missing detections with highest confidence from other classes
+                for class_id in class_counts:
+                    if len(class_counts[class_id]) == 0:
+                        highest_conf_det = max(sorted_det, key=lambda x: float(x[4]))
+                        class_counts[class_id].append(highest_conf_det)
+
+                # Select the most confident detection for each class
+                final_dets = [max(class_counts[class_id], key=lambda x: float(x[4])) for class_id in class_counts]
+
                 # Print results
-                for c in det[:, 5].unique():
-                    n = (det[:, 5] == c).sum()  # detections per class
+                for c in torch.tensor([d[5] for d in final_dets]).unique():
+                    n = (torch.tensor([d[5] for d in final_dets]) == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
-                for *xyxy, conf, cls in reversed(det):
+                for *xyxy, conf, cls in reversed(final_dets):
                     c = int(cls)  # integer class
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
@@ -212,13 +218,46 @@ def run(
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-                        with open(f"{txt_path}.txt", "a") as f:
+                        with open(f"{save_dir_labels / p.stem}.txt", "a") as f:  # Save to labels folder
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
+
+                    if save_ball:  # save bbox center point and radius
+                        # 'labels' 디렉터리 경로 확인 및 생성
+                        labels_dir = os.path.dirname(txt_path)
+                        if not os.path.exists(labels_dir):
+                            os.makedirs(labels_dir)
+
+                        x_center = (xyxy[0] + xyxy[2]) / 2
+                        y_center = (xyxy[1] + xyxy[3]) / 2
+                        radius = (xyxy[2] - xyxy[0]) / 2
+                        # normalize
+                        x_center = x_center / im0.shape[1]
+                        y_center = y_center / im0.shape[0]
+                        radius = radius / im0.shape[1]
+                        with open(f"{txt_path}.txt", "a") as f:
+                            f.write(f"{x_center} {y_center} {radius}\n")
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
                         annotator.box_label(xyxy, label, color=colors(c, True))
+
+                    if save_img or save_crop or view_img and save_ball:  # Add bbox to image
+                        c = int(cls)  # integer class
+                        label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
+                        annotator.box_label(xyxy, label, color=colors(c, True))
+
+                        # 원의 중심점과 반지름 계산
+                        x_center = int((xyxy[0] + xyxy[2]) / 2)
+                        y_center = int((xyxy[1] + xyxy[3]) / 2)
+                        radius = int((xyxy[2] - xyxy[0]) / 2)
+
+                        # 이미지에 원 그리기
+                        cv2.circle(im0, (x_center, y_center), radius, colors(c, True), 2)
+
+                        # 원의 중심점에 작은 원 그리기
+                        cv2.circle(im0, (x_center, y_center), 5, colors(c, True), -1)
+
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
@@ -235,7 +274,7 @@ def run(
             # Save results (image with detections)
             if save_img:
                 if dataset.mode == "image":
-                    cv2.imwrite(save_path, im0)
+                    cv2.imwrite(str(save_dir_images / p.name), im0)  # Save to images folder
                 else:  # 'video' or 'stream'
                     if vid_path[i] != save_path:  # new video
                         vid_path[i] = save_path
@@ -250,7 +289,7 @@ def run(
                         save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
                         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
                     vid_writer[i].write(im0)
-
+                    
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
@@ -276,6 +315,7 @@ def parse_opt():
     parser.add_argument("--max-det", type=int, default=1000, help="maximum detections per image")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--view-img", action="store_true", help="show results")
+    parser.add_argument("--save-ball", action="store_true", help="Save sphere radius and center to a text file")
     parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
     parser.add_argument("--save-csv", action="store_true", help="save results in CSV format")
     parser.add_argument("--save-conf", action="store_true", help="save confidences in --save-txt labels")
